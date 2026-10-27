@@ -2,8 +2,8 @@
 //
 // 数据流：
 //   Pi agent → modelRuntime.streamSimple（auth 解析 + before_provider_headers 合并）
-//     → 本插件 streamSimple wrapper（注入 22 头 + 自定义 fetch）
-//     → auth-fetch 拦截器（认证头注入 + 401/403 刷新重试 + 11133 瞬时 400 退避）
+//     → 本插件 streamSimple wrapper（注入动态头 + 自定义 fetch）
+//     → auth-fetch 拦截器（认证头注入 + 401 刷新重试 + 11133 瞬时 400 退避）
 //     → ${server}/v2/chat/completions
 //
 // 与 opencode 版的对应关系：
@@ -11,17 +11,24 @@
 //   opencode chat.headers       → wrapper 内 options.headers（provider 边界清晰，事件无 provider 信息）
 //   opencode config（模型发现） → registerProvider.models + 登录/启动后主动发现重注册
 //   opencode auth.methods       → registerProvider.oauth.login / refreshToken（Pi 原生 /login）
+//
+// 防识别说明（修改必读，详见 README）：
+// - X-Conversation-ID 稳定复用 + 按 turn 轮换；X-Request-ID 系每次 HTTP 尝试必换（含重试）。
+// - X-Machine-Id 稳定设备 ID，落盘复用；勿每次生成 fresh UUID。
+// - 版本四件套（UA/X-IDE-*）成对覆盖；Accept-Language 必带。
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks, RefreshModelsContext } from "@earendil-works/pi-ai";
-import { getConfig, resolveServerUrl, PROVIDER_ID, CHAT_COMPLETIONS_PATH, POLL_TOTAL_TIMEOUT_MS, DEFAULT_EXPIRES_MS } from "./config.js";
+import { getConfig, resolveServerUrl, PROVIDER_ID, CHAT_COMPLETIONS_PATH, POLL_TOTAL_TIMEOUT_MS, DEFAULT_EXPIRES_MS, STARTUP_DISCOVERY_TIMEOUT_MS, DISCOVERY_CACHE_TTL_MS, DISCOVERY_FALLBACK_TTL_MS } from "./config.js";
 import { createLogger } from "./log.js";
 import { LRUMap } from "./lru.js";
+import { ConversationTracker } from "./conversation.js";
+import { getOrCreateDeviceId } from "./device.js";
 import { effectiveAuth, pickAuthMode } from "./auth-state.js";
 import type { AuthState } from "./auth-state.js";
 import { requestAuthState, pollForToken, refreshAccessToken } from "./auth-flow.js";
 import { createAuthFetch } from "./auth-fetch.js";
 import { createCodebuddyStreamSimple } from "./stream.js";
-import { buildRequestHeaders, buildAuthHeaders } from "./headers.js";
+import { buildRequestHeaders, buildAuthHeaders, buildAttemptHeaders } from "./headers.js";
 import { resolveIdentity, decodeJwtPayload } from "./jwt.js";
 import { fetchRemoteModels, remoteModelToPi, DEFAULT_MODEL, DiscoveryCache, type RemoteModel } from "./models.js";
 import { readCachedModels, writeCachedModels } from "./model-cache.js";
@@ -35,14 +42,36 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
   const server = resolveServerUrl(cfg);
   const logger = createLogger();
   const conversationIds = new LRUMap<string, string>(cfg.conversationMapMax);
+  const tracker = new ConversationTracker(conversationIds, { maxTurns: cfg.conversationMaxTurns });
   const discoveryCache = new DiscoveryCache({
-    ttlMs: 5 * 60 * 1000,
-    fetchFn: (token, signal) => fetchRemoteModels(token, server, signal),
+    ttlMs: DISCOVERY_CACHE_TTL_MS,
+    fallbackTtlMs: DISCOVERY_FALLBACK_TTL_MS,
+    fetchFn: (token, signal) => fetchRemoteModels(token, server, signal, cfg, cfg.discoveryTimeoutMs),
   });
+
+  // 自定义 endpoint 经代理时 SNI 与 X-Domain 不一致，传输层直接暴露；提醒一次
+  try {
+    if (cfg.endpoint) {
+      const host = new URL(server.url).host;
+      const looksOfficial = /codebuddy|tencent/i.test(host);
+      if (!looksOfficial) {
+        logger.warn(`custom endpoint ${server.url} detected — SNI/X-Domain mismatch weakens anti-detection; prefer direct connection`);
+      }
+    }
+  } catch { /* URL 解析失败不影响运行 */ }
+
+  // 稳定设备 ID（防识别）：落盘复用，随 X-Machine-Id 发送；失败则本次进程用临时 ID
+  let deviceId = "";
+  try {
+    deviceId = await getOrCreateDeviceId();
+  } catch {
+    deviceId = "";
+  }
 
   // --- token 快照（~/.pi/agent/codebuddy-auth.json）---
   // Pi CredentialStore 不对扩展暴露读取接口；login/refresh 全部经过本扩展，
   // 顺手落一份独立快照供请求时读取。真实凭据源仍是 Pi auth.json（由 Pi 自动持久化）。
+  // 安全：600 权限 + 原子写（tmp+rename）；双源漂移时以 Pi store 为准，快照仅为请求期读取缓存。
   const snapshotPath = join(homedir(), CONFIG_DIR_NAME || ".pi", "agent", "codebuddy-auth.json");
   const syncSnapshot: { value: OAuthCredentials | undefined } = { value: undefined };
 
@@ -53,6 +82,10 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
       if (typeof o.access === "string" && o.access) {
         syncSnapshot.value = { access: o.access, refresh: o.refresh ?? "", expires: o.expires ?? 0 };
       }
+      // 收紧已存在文件的权限（best-effort，Windows 上可能失败）
+      try {
+        await fs.chmod(snapshotPath, 0o600);
+      } catch { /* 忽略 */ }
     } catch { /* 不存在或损坏 → 未登录 */ }
   }
   await loadSnapshot();
@@ -61,7 +94,12 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
     syncSnapshot.value = cred;
     try {
       await fs.mkdir(dirname(snapshotPath), { recursive: true });
-      await fs.writeFile(snapshotPath, JSON.stringify(cred, null, 2), "utf8");
+      const tmp = `${snapshotPath}.tmp`;
+      await fs.writeFile(tmp, JSON.stringify(cred, null, 2), { mode: 0o600 });
+      await fs.rename(tmp, snapshotPath);
+      try {
+        await fs.chmod(snapshotPath, 0o600);
+      } catch { /* 忽略 */ }
     } catch (e) {
       logger.error(`snapshot write failed: ${(e as Error).message}`);
     }
@@ -106,16 +144,18 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
     getAuth: async () => effectiveAuth(credToAuthState(syncSnapshot.value), cfg),
     server,
     buildAuthHeaders,
-    resolveIdentity: resolveIdentity as any,
+    resolveIdentity: resolveIdentity as unknown as AuthFetchDeps_resolveIdentity,
     decodeJwtPayload,
     refreshAndPersist,
     cfg,
     logger,
     chatCompletionsPath: CHAT_COMPLETIONS_PATH,
+    // 每次 HTTP 尝试换新鲜 Request-ID 系头部（Conversation-ID 保持稳定，由 wrapper 注入）
+    freshAttemptHeaders: () => buildAttemptHeaders(),
   });
   const streamSimple = createCodebuddyStreamSimple(authFetch, {
     buildHeaders: (model, options) =>
-      buildRequestHeaders(options?.sessionId, model.id, { cfg, server, lru: conversationIds }),
+      buildRequestHeaders(options?.sessionId, model.id, { cfg, server, tracker, deviceId }),
   });
 
   // --- 模型列表 ---
@@ -131,16 +171,19 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
   let registeredModels = cachedModels.length ? cachedModels : fallbackModels();
 
   // 主动发现 + 重注册（registerProvider 可随时调用并立即生效）
-  async function discoverAndReregister(token: string): Promise<void> {
+  async function discoverAndReregister(token: string, opts?: { timeoutMs?: number }): Promise<void> {
     try {
-      const remote = await discoveryCache.get(token, { signal: undefined });
+      // 启动期用短超时，避免离线罚站；常规 refreshModels 走正常 TTL/超时
+      const remote = opts?.timeoutMs
+        ? await fetchRemoteModels(token, server, undefined, cfg, opts.timeoutMs).then((r) => r)
+        : await discoveryCache.get(token, { signal: undefined });
       const models = modelsFromRemote(remote);
       if (!models.length) return;
       registeredModels = models;
       register(models);
       await writeCachedModels(models);
     } catch (e) {
-      const status = (e as any)?.status;
+      const status = (e as { status?: number })?.status;
       if (status === 401 || status === 403) {
         logger.warn("model discovery 401/403 — token may be expired, re-run /login codebuddy");
       } else {
@@ -157,12 +200,12 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
       // 认证统一由 auth-fetch 拦截器注入（oauth 双头身份 + api 双头 key）；
       // apiKey 仅作为 OpenAI client 的占位（拦截器会覆写 Authorization）
       apiKey: cfg.apiKey || "not-used",
-      models: models as any,
+      models: models as never,
       streamSimple,
       oauth: {
         name: "CodeBuddy (IOA)",
         async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-          const state = await requestAuthState(server.url);
+          const state = await requestAuthState(server.url, cfg.platform);
           callbacks.onAuth({ url: state.url, instructions: "请在浏览器中完成 IOA 登录" });
           const expiresAt = Date.now() + POLL_TOTAL_TIMEOUT_MS;
           const tok = await pollForToken(server.url, state.state, expiresAt, callbacks.signal);
@@ -203,26 +246,45 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
             if (models.length) {
               registeredModels = models;
               await writeCachedModels(models);
-              return models as any;
+              return models as never;
             }
           } catch (e) {
             logger.warn(`model discovery failed: ${(e as Error).message}`);
           }
         }
-        return registeredModels as any;
+        return registeredModels as never;
       },
-    } as any);
+    } as never);
   }
 
   register(registeredModels);
 
   // 启动时已有快照 token → 发现真实模型列表
-  // 注意：必须 await。原先的 void（fire-and-forget）会让发现与进程退出赛跑，
-  // --list-models 这类短命进程会在 /v3/config 返回前退出，缓存永远写不进。
-  // 扩展 factory 阶段 pi 会等待，且 discoveryCache 有 5s 超时与 try/catch 兜底，不会卡住启动。
+  // 启动用短超时（默认 2.5s）：短命进程（--list-models）仍能等到写缓存，离线用户不被罚 5s。
+  // 超时后后台 refreshModels（allowNetwork）会补全；缓存种子保证首屏模型可用。
   const mode = pickAuthMode(cfg, credToAuthState(syncSnapshot.value));
   if (mode === "oauth" && syncSnapshot.value?.access) {
-    await discoverAndReregister(syncSnapshot.value.access);
+    const token = syncSnapshot.value.access;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), STARTUP_DISCOVERY_TIMEOUT_MS);
+    try {
+      const remote = await fetchRemoteModels(token, server, ctrl.signal, cfg, STARTUP_DISCOVERY_TIMEOUT_MS);
+      const models = modelsFromRemote(remote);
+      if (models.length) {
+        registeredModels = models;
+        register(models);
+        await writeCachedModels(models);
+      }
+    } catch (e) {
+      const status = (e as { status?: number })?.status;
+      if (status === 401 || status === 403) {
+        logger.warn("model discovery 401/403 — token may be expired, re-run /login codebuddy");
+      } else {
+        logger.warn(`model discovery failed: ${(e as Error).message}`);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
   } else if (mode === "api" && !cfg.apiKey) {
     logger.warn("api key mode requested but no key found — set CODEBUDDY_API_KEY");
   }
@@ -230,6 +292,9 @@ export default async function codebuddyExtension(pi: ExtensionAPI) {
   // --- compaction 后淘汰 conversation-id（对应 opencode session.compacted）---
   pi.on("session_before_compact", (_event, ctx) => {
     const sid = ctx.sessionManager.getSessionId();
-    if (sid) conversationIds.delete(sid);
+    if (sid) tracker.delete(sid);
   });
 }
+
+// 仅为避开 `resolveIdentity as any` 的 eslint 噪音而起的别名（行为不变）
+type AuthFetchDeps_resolveIdentity = (payload: unknown, cfg: unknown) => { tenantId: string; enterpriseId: string; userId: string };

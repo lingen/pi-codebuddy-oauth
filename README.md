@@ -12,9 +12,11 @@
 - **OAuth 登录** — Pi 原生 `/login` 流程接入 IOA：`/v2/plugin/auth/state` → 浏览器 → 轮询 token。token 刷新由 Pi 双检锁托管（5 分钟 skew 预刷新）。
 - **API Key 登录** — 设置 `CODEBUDDY_API_KEY`（`ck_xxx`）即可，无需浏览器。
 - **自动模型发现** — 调用 `GET /v3/config` 提取 craft agent 模型列表（5 分钟 TTL 缓存 + 单飞；登录后自动触发）。
-- **401/403 中途刷新重试** — 流式请求中 token 失效时自动刷新并重试一次（15 秒冷却防抖）。
-- **瞬时 400（code 11133）自动重试** — CodeBuddy 网关偶发把上游瞬时校验失败包装成 HTTP 400 `{"code":11133}` 返回；拦截器按 **1s → 4s → 10s → 25s** 退避幂等重发（最多 4 次，总等待 ≤40s），其他 400 原样透传。
-- **session 级 `X-Conversation-ID` 稳定化** — 同一 Pi session 复用同一 conversation id，提升上游 prompt cache 命中率（compaction 时淘汰）。
+- **401 中途刷新重试** — 流式请求中 token 失效时自动刷新并重试一次（15 秒冷却防抖；403 为永久失败直接透传，不浪费 refresh 配额）。
+- **瞬时 400（code 11133）自动重试** — CodeBuddy 网关偶发把上游瞬时校验失败包装成 HTTP 400 `{"code":11133}` 返回；拦截器按 **1s → 4s → 10s → 25s（±20% 抖动）** 幂等重发（最多 4 次），其他 400 原样透传。每次重试换新鲜 `X-Request-ID`，`X-Conversation-ID` 保持稳定。
+- **session 级 `X-Conversation-ID` 稳定化 + 按 turn 轮换** — 同一 Pi session 复用同一 conversation id，提升上游 prompt cache 命中率；超过 `CODEBUDDY_CONVERSATION_MAX_TURNS`（默认 50）自动轮换，避免单个 conversation 跑几百 turn 被画像（compaction 时淘汰）。
+- **稳定设备 ID** — 首次运行生成 `~/.pi/agent/codebuddy-device.json`（600 权限）并随 `X-Machine-Id` 发送，避免“同一 token 每次换设备”。
+- **拟真客户端头** — `Accept-Language` 跟随系统 locale，版本四件套（UA / `X-IDE-*`）支持成对覆盖，`trace/span/parent` 三次独立随机。
 - **环境自动切换** — 默认国内端点（`copilot.tencent.com`），`CODEBUDDY_NETWORK=internet` 切国际（`www.codebuddy.ai`），`CODEBUDDY_ENDPOINT` 覆盖完整 URL。
 
 ## 安装
@@ -55,9 +57,14 @@ export CODEBUDDY_API_KEY=ck_xxx
 | `CODEBUDDY_NETWORK` | `internal` | `internal`/`ioa` → 国内端点；其他 → 国际端点 |
 | `CODEBUDDY_AUTH` | `auto` | `auto` / `oauth` / `api` |
 | `CODEBUDDY_API_KEY` | _(空)_ | API Key（`ck_xxx`），`auto` 模式下隐含启用 API Key 模式 |
-| `CODEBUDDY_MODEL` | _(空)_ | 强制覆盖请求 model（写进 `X-Model-ID`） |
+| `CODEBUDDY_MODEL` | _(空)_ | 强制覆盖请求 model（同时写 `X-Model-ID` 与 body.model，保持头体一致） |
 | `CODEBUDDY_STABLE_CONVERSATION` | `1` | `0` 关闭 session 级 conversation-id 稳定化 |
 | `CODEBUDDY_CONVERSATION_MAP_MAX` | `1000` | session → conversationId LRU 容量 |
+| `CODEBUDDY_CONVERSATION_MAX_TURNS` | `50` | 单个 conversation 复用上限，超过自动轮换（`<=0` 不限） |
+| `CODEBUDDY_MACHINE_ID` | _(自动生成)_ | 覆盖稳定设备 ID（默认读 `~/.pi/agent/codebuddy-device.json`） |
+| `CODEBUDDY_ACCEPT_LANGUAGE` | _(跟随系统)_ | 覆盖 `Accept-Language`，默认中文系统 `zh-CN,zh;q=0.9,en;q=0.8`，英文系统 `en-US,en;q=0.9` |
+| `CODEBUDDY_APP_VERSION` / `CODEBUDDY_IDE_VERSION` / `CODEBUDDY_IDE_NAME` / `CODEBUDDY_IDE_TYPE` / `CODEBUDDY_PLATFORM` | _(内置)_ | 客户端指纹四件套覆盖，UA 与 `X-IDE-*` 成对生效；官方更新后请同步跟进 |
+| `CODEBUDDY_DISCOVERY_TIMEOUT_MS` | `5000` | `GET /v3/config` 超时（启动期固定用 2.5s 短超时，离线不罚站） |
 | `CODEBUDDY_TENANT_ID` / `CODEBUDDY_ENTERPRISE_ID` / `CODEBUDDY_USER_ID` | _(从 JWT 提)_ | 覆盖自动提取的身份头（仅 OAuth 模式） |
 
 ## 架构
@@ -67,13 +74,13 @@ Pi agent
   │ modelRuntime.streamSimple（auth 解析 / 凭据刷新）
   ▼
 streamSimple wrapper（src/stream.ts）
-  │ 注入 22 头（X-Conversation-ID 稳定化 / B3 / X-Model-ID …）
+  │ 注入动态头（X-Conversation-ID 稳定复用+按turn轮换 / 每次新鲜 Request-ID 系 / B3 / X-Model-ID / X-Machine-Id / Accept-Language …）
   │ 注入自定义 fetch
   ▼
 auth-fetch 拦截器（src/auth-fetch.ts）
   │ 认证头注入（oauth: Bearer + 租户身份头 / api: Bearer + X-API-Key）
-  │ 401/403 → 刷新 token 重试一次
-  │ 400+11133 → 1s/4s/10s/25s 幂等重发
+  │ 401 → 刷新 token 重试一次（403 直接透传；15s 冷却；每次重试换新鲜 Request-ID）
+  │ 400+11133 → 1s/4s/10s/25s + ±20% 抖动幂等重发
   ▼
 ${server}/v2/chat/completions   （协议栈：pi-ai openai-completions）
 ```
@@ -101,6 +108,25 @@ token 的过期预检与刷新由 Pi 原生托管（`oauth.refreshToken`，5 分
 刻意不写入 `models.json`：codebuddy 是扩展注册的 provider，鉴权由 `auth-fetch` 拦截器注入
 （自定义 `streamSimple`）。在 `models.json` 声明同 id 的原生 provider 会产生 baseUrl/api
 双重定义并绕过拦截器，也会与 pi-model-manager 的跨进程锁相互干扰。
+
+### 防识别说明
+
+本插件把 Pi 伪装成 VSCode 官方插件。服务端可从三处识别自动化：静态指纹、行为节律、协议指纹。
+已做的对抗（按收益排序）：
+
+1. **去群体签名** — `X-Request-ID` / `X-Conversation-Request-ID` / `X-Conversation-Message-ID`
+   三者互相独立、每次 HTTP 尝试（含 401/11133 重试）必换；`trace/span/parent` 三次独立随机；
+   11133 退避与登录轮询加 ±20% 抖动。全网用户不再共享同一节奏。
+2. **补必带头** — `Accept-Language` 跟随系统 locale；`X-Machine-Id` 落盘复用；版本四件套支持成对覆盖
+   （`CODEBUDDY_APP_VERSION` 与 `CODEBUDDY_IDE_VERSION` 取自同一期官方发布，避免“不存在的版本组合”）。
+3. **头体一致** — `CODEBUDDY_MODEL` 覆盖时同步改写 `body.model` 与 `X-Model-ID`；能力字段
+   （`reasoning` / `image`）优先用服务端下发的 `supports*` 而非 id 正则。
+4. **收敛异常请求** — 仅 401 刷新（403 直接透传）；非字符串 body 不重试；fallback 模型用 30s 短 TTL，
+   失败不压制后续发现；启动期 2.5s 短超时，离线不罚站。
+
+运维建议：勿多机共享同一 `codebuddy-auth.json` 快照（等同异地登录）；自定义 `CODEBUDDY_ENDPOINT`
+走代理时 SNI 与 `X-Domain` 不一致会直接暴露，优先直连。`X-Machine-Id` 字段名为 best-effort，
+抓到真实包后请对齐官方字段名。
 
 ## 开发
 

@@ -1,6 +1,6 @@
 {
   "name": "pi-codebuddy-oauth",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Pi extension that registers CodeBuddy (IOA) as an OpenAI-compatible HTTP provider with OAuth/API-key auth",
   "license": "MIT",
   "type": "module",

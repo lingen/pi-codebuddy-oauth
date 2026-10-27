@@ -171,4 +171,55 @@ describe("auth-fetch (pi)", () => {
     expect(headers.get("X-Enterprise-Id")).toBe("e1");
     expect(headers.get("X-User-Id")).toBe("u1");
   });
+  it("403 不触发刷新（永久失败直接透传）", async () => {
+    const spy = vi.fn().mockResolvedValue(new Response("forbidden", { status: 403 }));
+    const refreshAndPersist = vi.fn();
+    const af = createAuthFetch(makeDeps({
+      getAuth: async () => ({ type: "oauth", access: "old", refresh: "r", expires: 0 }),
+      refreshAndPersist,
+      fetchImpl: spy as any,
+    }));
+    const res = await af("https://x/v2/chat/completions", { method: "POST", body: "{}" });
+    expect(res.status).toBe(403);
+    expect(refreshAndPersist).not.toHaveBeenCalled();
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+  it("重试换新鲜 Request-ID（Conversation-ID 保持稳定）", async () => {
+    const responses = [
+      new Response(JSON.stringify({ code: 11133 }), { status: 400 }),
+      new Response("ok", { status: 200 }),
+    ];
+    const spy = vi.fn().mockImplementation(() => Promise.resolve(responses.shift()!));
+    const fresh = (() => { let n = 0; return () => ({ "X-Request-ID": `req-${++n}`, "X-Conversation-Request-ID": `creq-${n}`, "X-Conversation-Message-ID": `msg-${n}` }); })();
+    const af = createAuthFetch(makeDeps({ fetchImpl: spy as any, freshAttemptHeaders: fresh, rand: () => 0.5 }));
+    vi.useFakeTimers();
+    const p = af("https://x/v2/chat/completions", { method: "POST", headers: { "X-Conversation-ID": "conv-stable" }, body: "{}" });
+    await vi.runAllTimersAsync();
+    await p;
+    vi.useRealTimers();
+    expect(spy).toHaveBeenCalledTimes(2);
+    const h1 = spy.mock.calls[0][1].headers as Headers;
+    const h2 = spy.mock.calls[1][1].headers as Headers;
+    expect(h1.get("X-Request-ID")).toBe("req-1");
+    expect(h2.get("X-Request-ID")).toBe("req-2");
+    expect(h1.get("X-Conversation-ID")).toBe("conv-stable");
+    expect(h2.get("X-Conversation-ID")).toBe("conv-stable");
+  });
+  it("CODEBUDDY_MODEL 覆盖时同步改写 body.model（头体一致）", async () => {
+    const spy = vi.fn().mockResolvedValue(new Response("ok", { status: 200 }));
+    const af = createAuthFetch(makeDeps({
+      cfg: { model: "hy4-override" } as any,
+      fetchImpl: spy as any,
+    }));
+    await af("https://x/v2/chat/completions", { method: "POST", body: JSON.stringify({ model: "codebuddy/old", stream: false }) });
+    expect(JSON.parse(spy.mock.calls[0][1].body).model).toBe("hy4-override");
+  });
+  it("非字符串 body 不进 11133 重试（不可幂等）", async () => {
+    const spy = vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: 11133 }), { status: 400 }));
+    const af = createAuthFetch(makeDeps({ fetchImpl: spy as any }));
+    const body = new Blob([JSON.stringify({ a: 1 })]);
+    const res = await af("https://x/v2/chat/completions", { method: "POST", body: body as any });
+    expect(res.status).toBe(400);
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
 });
